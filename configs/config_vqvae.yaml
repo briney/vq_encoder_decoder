@@ -1,13 +1,25 @@
 fix_seed: 0
 checkpoints_every: 256
+checkpoint_every_n_steps: null  # If set, overrides checkpoints_every (step-based instead of epoch-based)
 tensorboard_log: True
 tqdm_progress_bar: False
+console_log_training: False  # If False, suppresses training epoch results from console
+console_log_validation: True  # If False, suppresses validation epoch results from console
 result_path: ./results/test
 find_unused_parameters: False
 dispatch_batches: False
 even_batches: True
 non_blocking: False
 split_batches: False
+
+wandb:
+  enabled: True
+  project: "vq-encoder-decoder"  # project name
+  entity: null  # team/user name (optional)
+  name: null  # run name (will auto-generate if null)
+  tags: []  # list of tags for the run
+  notes: ""  # optional notes
+  group: null  # group name for related runs
 
 resume:
   enabled: False
@@ -71,6 +83,8 @@ model:
 train_settings:
   data_path: ../../datasets/vqvae/uniref_50/
   num_epochs: 32
+  max_train_steps: null  # If set, overrides num_epochs for training duration (step-based)
+  log_every_n_steps: null  # If set, logs metrics at this step interval
   sample_weighting:
     enabled: True
     min_weight: 1.0
@@ -134,6 +148,7 @@ train_settings:
 valid_settings:
   data_path: ../../datasets/vqvae/whole_validation_2048_h5/
   do_every: 1
+  validate_every_n_steps: null  # If set, overrides do_every for validation frequency (step-based)
   save_pdb_every: 1
   batch_size: 8
   num_workers: 0

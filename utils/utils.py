@@ -1,23 +1,25 @@
-import os
-import glob
-import datetime
-import shutil
 import ast
+import datetime
+import glob
 import logging as log
+import os
+import shutil
+import sys
 from collections import OrderedDict
+from io import StringIO
 from pathlib import Path
-from box import Box
-from torch.utils.tensorboard import SummaryWriter
+
+import h5py
+import numpy as np
 import torch
 import torch.optim as optim
-import numpy as np
+import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-import sys
+from box import Box
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
-import yaml
-import h5py
-from io import StringIO
+from torch.utils.tensorboard import SummaryWriter
+
 try:  # Optional dependency retained for legacy workflows
     from hydra import compose, initialize  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - fallback when Hydra is unavailable
@@ -40,7 +42,7 @@ def load_all_configs():
             overrides=[
                 "+encoder=config_gcpnet_encoder",  # Load encoder config
                 "+decoder=config_geometric_decoder",  # Load decoder config
-            ]
+            ],
         )
 
     return cfg
@@ -112,7 +114,7 @@ def get_logging(result_path, configs):
 
 def get_dummy_logger():
     # Create a logger object
-    logger = log.getLogger('dummy')
+    logger = log.getLogger("dummy")
     logger.setLevel(log.INFO)
 
     # Create a string buffer to hold the logs
@@ -120,7 +122,7 @@ def get_dummy_logger():
 
     # Create a stream handler that writes to the string buffer
     handler = log.StreamHandler(log_buffer)
-    formatter = log.Formatter('%(asctime)s - %(message)s')
+    formatter = log.Formatter("%(asctime)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
@@ -141,7 +143,9 @@ def _remap_gcp_encoder_keys(state_dict, model, logger=None):
         return state_dict
 
     try:
-        from models.gcpnet.models.base import PretrainedEncoder  # local import avoids circular import on module load
+        from models.gcpnet.models.base import (
+            PretrainedEncoder,  # local import avoids circular import on module load
+        )
     except ImportError:  # pragma: no cover - defensive guard if dependency missing
         PretrainedEncoder = ()  # type: ignore
 
@@ -161,8 +165,10 @@ def _remap_gcp_encoder_keys(state_dict, model, logger=None):
         remapped = OrderedDict()
         for key, value in state_dict.items():
             if key.startswith("encoder.encoder."):
-                remapped["encoder." + key[len("encoder.encoder."):]] = value
-            elif key.startswith("encoder.featuriser.") or key.startswith("encoder.task_transform."):
+                remapped["encoder." + key[len("encoder.encoder.") :]] = value
+            elif key.startswith("encoder.featuriser.") or key.startswith(
+                "encoder.task_transform."
+            ):
                 continue
             else:
                 remapped[key] = value
@@ -174,11 +180,13 @@ def _remap_gcp_encoder_keys(state_dict, model, logger=None):
         remapped = OrderedDict()
         for key, value in state_dict.items():
             if _is_unwrapped_key(key):
-                remapped["encoder.encoder." + key[len("encoder."):]] = value
+                remapped["encoder.encoder." + key[len("encoder.") :]] = value
             else:
                 remapped[key] = value
         if logger is not None:
-            logger.info("Remapped encoder checkpoint keys for pretrained encoder wrapper.")
+            logger.info(
+                "Remapped encoder checkpoint keys for pretrained encoder wrapper."
+            )
         return remapped
 
     return state_dict
@@ -200,41 +208,52 @@ def save_checkpoint(epoch: int, model_path: str, accelerator: Accelerator, **kwa
 
     # Save the models checkpoint.
     try:
-        unwrapped = accelerator.unwrap_model(kwargs['net'], keep_torch_compile=True)
+        unwrapped = accelerator.unwrap_model(kwargs["net"], keep_torch_compile=True)
     except KeyError:
-        unwrapped = getattr(kwargs['net'], "module", kwargs['net'])
+        unwrapped = getattr(kwargs["net"], "module", kwargs["net"])
     base_model = getattr(unwrapped, "_orig_mod", unwrapped)
 
     raw_state = base_model.state_dict()
     clean_state = OrderedDict(
-        (k.replace('_orig_mod.', ''), v) for k, v in raw_state.items()
+        (k.replace("_orig_mod.", ""), v) for k, v in raw_state.items()
     )
 
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': clean_state,
-        'optimizer_state_dict': kwargs['optimizer'].state_dict(),
-        'scheduler_state_dict': kwargs['scheduler'].state_dict() if kwargs.get('scheduler') is not None else None,
-    }, model_path)
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": kwargs.get("global_step", 0),
+            "model_state_dict": clean_state,
+            "optimizer_state_dict": kwargs["optimizer"].state_dict(),
+            "scheduler_state_dict": kwargs["scheduler"].state_dict()
+            if kwargs.get("scheduler") is not None
+            else None,
+        },
+        model_path,
+    )
 
 
 def load_checkpoints_simple(checkpoint_path, net, logger, decoder_only=False):
-    model_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    pretrained_state_dict = model_checkpoint['model_state_dict']
+    model_checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    pretrained_state_dict = model_checkpoint["model_state_dict"]
 
     # Torch-compiled checkpoints wrap submodules in `_orig_mod`; strip for compatibility.
     pretrained_state_dict = {
-        k.replace('_orig_mod.', ''): v for k, v in pretrained_state_dict.items()
+        k.replace("_orig_mod.", ""): v for k, v in pretrained_state_dict.items()
     }
 
     pretrained_state_dict = _remap_gcp_encoder_keys(pretrained_state_dict, net, logger)
 
     if decoder_only:
-        pretrained_state_dict = {k: v for k, v in pretrained_state_dict.items() if
-                                 not (k.startswith('encoder') or k.startswith('vqvae.encoder'))}
+        pretrained_state_dict = {
+            k: v
+            for k, v in pretrained_state_dict.items()
+            if not (k.startswith("encoder") or k.startswith("vqvae.encoder"))
+        }
 
     load_log = net.load_state_dict(pretrained_state_dict, strict=False)
-    logger.info(f'Loading checkpoint log: {load_log}')
+    logger.info(f"Loading checkpoint log: {load_log}")
     return net
 
 
@@ -250,34 +269,47 @@ def load_checkpoints(configs, optimizer, scheduler, logging, net, accelerator):
         net (nn.Module): The neural network models to load the saved checkpoints into.
 
     Returns:
-        tuple: A tuple containing the loaded neural network models and the epoch to start training from.
+        tuple: A tuple containing the loaded neural network models, the epoch to start training from, and the global step.
     """
     start_epoch = 1
+    start_global_step = 0
 
     # If the 'enabled' flag is True, load the saved models checkpoints.
     if configs.resume.enabled:
-        model_checkpoint = torch.load(configs.resume.resume_path, map_location='cpu', weights_only=False)
-        pretrained_state_dict = model_checkpoint['model_state_dict']
-        pretrained_state_dict = {k.replace('_orig_mod.', ''): v for k, v in pretrained_state_dict.items()}
+        model_checkpoint = torch.load(
+            configs.resume.resume_path, map_location="cpu", weights_only=False
+        )
+        pretrained_state_dict = model_checkpoint["model_state_dict"]
+        pretrained_state_dict = {
+            k.replace("_orig_mod.", ""): v for k, v in pretrained_state_dict.items()
+        }
 
-        if configs.resume.get('discard_decoder_weights', False):
+        if configs.resume.get("discard_decoder_weights", False):
             logging.info("Discarding decoder weights from checkpoint.")
-            keys_to_remove = [k for k in pretrained_state_dict if k.startswith('vqvae.decoder')]
+            keys_to_remove = [
+                k for k in pretrained_state_dict if k.startswith("vqvae.decoder")
+            ]
             for k in keys_to_remove:
                 del pretrained_state_dict[k]
 
-        pretrained_state_dict = _remap_gcp_encoder_keys(pretrained_state_dict, net, logging)
+        pretrained_state_dict = _remap_gcp_encoder_keys(
+            pretrained_state_dict, net, logging
+        )
 
         loading_log = net.load_state_dict(pretrained_state_dict, strict=False)
 
-        logging.info(f'Loading checkpoint log: {loading_log}')
+        logging.info(f"Loading checkpoint log: {loading_log}")
 
         # If the saved checkpoint contains the optimizer and scheduler states and the epoch number,
         # resume training from the last saved epoch.
-        if 'optimizer_state_dict' in model_checkpoint and 'scheduler_state_dict' in model_checkpoint and 'epoch' in model_checkpoint:
+        if (
+            "optimizer_state_dict" in model_checkpoint
+            and "scheduler_state_dict" in model_checkpoint
+            and "epoch" in model_checkpoint
+        ):
             if not configs.resume.restart_optimizer:
-                optimizer.load_state_dict(model_checkpoint['optimizer_state_dict'])
-                logging.info('Optimizer is loaded to resume training!')
+                optimizer.load_state_dict(model_checkpoint["optimizer_state_dict"])
+                logging.info("Optimizer is loaded to resume training!")
 
                 # scheduler.load_state_dict(model_checkpoint['scheduler_state_dict'])
                 # if accelerator.main_process:
@@ -285,20 +317,26 @@ def load_checkpoints(configs, optimizer, scheduler, logging, net, accelerator):
 
             # start_epoch = model_checkpoint['epoch'] + 1
             start_epoch = 1
-        logging.info('Model is loaded to resume training!')
-    return net, start_epoch
+
+        # Load global_step if available (for backward compatibility with old checkpoints)
+        if "global_step" in model_checkpoint:
+            start_global_step = model_checkpoint["global_step"]
+            logging.info(f"Resuming from global step {start_global_step}")
+
+        logging.info("Model is loaded to resume training!")
+    return net, start_epoch, start_global_step
 
 
 def prepare_tensorboard(result_path):
-    train_path = os.path.join(result_path, 'train')
-    val_path = os.path.join(result_path, 'val')
+    train_path = os.path.join(result_path, "train")
+    val_path = os.path.join(result_path, "val")
     Path(train_path).mkdir(parents=True, exist_ok=True)
     Path(val_path).mkdir(parents=True, exist_ok=True)
 
-    train_log_path = os.path.join(train_path, 'tensorboard')
+    train_log_path = os.path.join(train_path, "tensorboard")
     train_writer = SummaryWriter(train_log_path)
 
-    val_log_path = os.path.join(val_path, 'tensorboard')
+    val_log_path = os.path.join(val_path, "tensorboard")
     val_writer = SummaryWriter(val_log_path)
 
     return train_writer, val_writer
@@ -307,9 +345,29 @@ def prepare_tensorboard(result_path):
 def prepare_optimizer(net, configs, num_train_samples, logging):
     optimizer, scheduler = load_opt(net, configs, logging)
     if scheduler is None:
-        whole_steps = np.ceil(
+        steps_per_epoch = np.ceil(
             num_train_samples / configs.train_settings.grad_accumulation
-        ) * configs.train_settings.num_epochs / configs.optimizer.decay.num_restarts
+        )
+
+        # Use step-based if provided, otherwise epoch-based
+        if getattr(configs.train_settings, "max_train_steps", None) is not None:
+            whole_steps = (
+                configs.train_settings.max_train_steps
+                / configs.optimizer.decay.num_restarts
+            )
+            logging.info(
+                f"Using step-based scheduler with max_train_steps={configs.train_settings.max_train_steps}"
+            )
+        else:
+            whole_steps = (
+                steps_per_epoch
+                * configs.train_settings.num_epochs
+                / configs.optimizer.decay.num_restarts
+            )
+            logging.info(
+                f"Using epoch-based scheduler with num_epochs={configs.train_settings.num_epochs}"
+            )
+
         first_cycle_steps = np.ceil(whole_steps / configs.optimizer.decay.num_restarts)
         scheduler = CosineAnnealingWarmupRestarts(
             optimizer,
@@ -318,60 +376,78 @@ def prepare_optimizer(net, configs, num_train_samples, logging):
             max_lr=configs.optimizer.lr,
             min_lr=configs.optimizer.decay.min_lr,
             warmup_steps=configs.optimizer.decay.warmup,
-            gamma=configs.optimizer.decay.gamma)
+            gamma=configs.optimizer.decay.gamma,
+        )
 
     return optimizer, scheduler
 
 
 def load_opt(model, config, logging):
     scheduler = None
-    if config.optimizer.name.lower() == 'adabelief':
-        opt = optim.AdaBelief(model.parameters(), lr=config.optimizer.lr, eps=config.optimizer.eps,
-                              decoupled_decay=True,
-                              weight_decay=config.optimizer.weight_decay, rectify=False)
-    elif config.optimizer.name.lower() == 'adam' and config.optimizer.weight_decouple:
+    if config.optimizer.name.lower() == "adabelief":
+        opt = optim.AdaBelief(
+            model.parameters(),
+            lr=config.optimizer.lr,
+            eps=config.optimizer.eps,
+            decoupled_decay=True,
+            weight_decay=config.optimizer.weight_decay,
+            rectify=False,
+        )
+    elif config.optimizer.name.lower() == "adam" and config.optimizer.weight_decouple:
         if config.optimizer.use_8bit_adam:
             import bitsandbytes
-            logging.info('use 8-bit adamw')
+
+            logging.info("use 8-bit adamw")
             opt = bitsandbytes.optim.AdamW8bit(
-                model.parameters(), lr=float(config.optimizer.lr),
+                model.parameters(),
+                lr=float(config.optimizer.lr),
                 betas=(config.optimizer.beta_1, config.optimizer.beta_2),
                 weight_decay=float(config.optimizer.weight_decay),
                 eps=float(config.optimizer.eps),
             )
         else:
             opt = torch.optim.AdamW(
-                model.parameters(), lr=float(config.optimizer.lr),
+                model.parameters(),
+                lr=float(config.optimizer.lr),
                 betas=(config.optimizer.beta_1, config.optimizer.beta_2),
                 weight_decay=float(config.optimizer.weight_decay),
-                eps=float(config.optimizer.eps)
+                eps=float(config.optimizer.eps),
             )
-    elif config.optimizer.name.lower() == 'adam':
-        opt = optim.Adam(model.parameters(), lr=config.optimizer.lr, weight_decay=config.optimizer.weight_decay,
-                         eps=config.optimizer.eps, betas=(config.optimizer.beta_1, config.optimizer.beta_2))
+    elif config.optimizer.name.lower() == "adam":
+        opt = optim.Adam(
+            model.parameters(),
+            lr=config.optimizer.lr,
+            weight_decay=config.optimizer.weight_decay,
+            eps=config.optimizer.eps,
+            betas=(config.optimizer.beta_1, config.optimizer.beta_2),
+        )
 
-    elif config.optimizer.name.lower() == 'sgd' and config.optimizer.weight_decouple:
-        raise ValueError('SGD with weight decouple is not supported yet')
+    elif config.optimizer.name.lower() == "sgd" and config.optimizer.weight_decouple:
+        raise ValueError("SGD with weight decouple is not supported yet")
 
-    elif config.optimizer.name.lower() == 'sgd':
-        opt = optim.SGD(model.parameters(), lr=config.optimizer.lr, weight_decay=config.optimizer.weight_decay)
+    elif config.optimizer.name.lower() == "sgd":
+        opt = optim.SGD(
+            model.parameters(),
+            lr=config.optimizer.lr,
+            weight_decay=config.optimizer.weight_decay,
+        )
 
     # Removed support for 'schedulerfree' optimizer
     else:
-        raise ValueError('wrong optimizer')
+        raise ValueError("wrong optimizer")
     return opt, scheduler
 
 
 def load_configs(config):
     """
-        Load the configuration file and convert the necessary values to floats.
+    Load the configuration file and convert the necessary values to floats.
 
-        Args:
-            config (dict): The configuration dictionary.
+    Args:
+        config (dict): The configuration dictionary.
 
-        Returns:
-            The updated configuration dictionary with float values.
-        """
+    Returns:
+        The updated configuration dictionary with float values.
+    """
 
     # Convert the dictionary to a Box object for easier access to the values.
     tree_config = Box(config)
@@ -387,14 +463,14 @@ def load_configs(config):
 
 def load_configs_gvp(config):
     """
-        Load the configuration file and convert the necessary values to floats.
+    Load the configuration file and convert the necessary values to floats.
 
-        Args:
-            config (dict): The configuration dictionary.
+    Args:
+        config (dict): The configuration dictionary.
 
-        Returns:
-            The updated configuration dictionary with float values.
-        """
+    Returns:
+        The updated configuration dictionary with float values.
+    """
 
     # Convert the dictionary to a Box object for easier access to the values.
     tree_config = Box(config)
@@ -418,19 +494,22 @@ def load_configs_gvp(config):
     if not hasattr(tree_config.model.struct_encoder, "gvp_num_layers"):
         tree_config.model.struct_encoder.gvp_num_layers = 3  # default
 
-    if not hasattr(tree_config.model.struct_encoder,
-                   "use_rotary_embeddings"):  # configs also have num_rbf and num_positional_embeddings
+    if not hasattr(
+        tree_config.model.struct_encoder, "use_rotary_embeddings"
+    ):  # configs also have num_rbf and num_positional_embeddings
         tree_config.model.struct_encoder.use_rotary_embeddings = False
 
     if not hasattr(tree_config.model.struct_encoder, "rotary_mode"):
         tree_config.model.struct_encoder.rotary_mode = 1
 
-    if not hasattr(tree_config.model.struct_encoder,
-                   "use_foldseek"):  # configs also have num_rbf and num_positional_embeddings
+    if not hasattr(
+        tree_config.model.struct_encoder, "use_foldseek"
+    ):  # configs also have num_rbf and num_positional_embeddings
         tree_config.model.struct_encoder.use_foldseek = False
 
-    if not hasattr(tree_config.model.struct_encoder,
-                   "use_foldseek_vector"):  # configs also have num_rbf and num_positional_embeddings
+    if not hasattr(
+        tree_config.model.struct_encoder, "use_foldseek_vector"
+    ):  # configs also have num_rbf and num_positional_embeddings
         tree_config.model.struct_encoder.use_foldseek_vector = False
 
     if not hasattr(tree_config.model.struct_encoder, "num_rbf"):
@@ -442,12 +521,16 @@ def load_configs_gvp(config):
     if not hasattr(tree_config.model.struct_encoder, "node_h_dim"):
         tree_config.model.struct_encoder.node_h_dim = (100, 32)  # default
     else:
-        tree_config.model.struct_encoder.node_h_dim = ast.literal_eval(tree_config.model.struct_encoder.node_h_dim)
+        tree_config.model.struct_encoder.node_h_dim = ast.literal_eval(
+            tree_config.model.struct_encoder.node_h_dim
+        )
 
     if not hasattr(tree_config.model.struct_encoder, "edge_h_dim"):
         tree_config.model.struct_encoder.edge_h_dim = (32, 1)  # default
     else:
-        tree_config.model.struct_encoder.edge_h_dim = ast.literal_eval(tree_config.model.struct_encoder.edge_h_dim)
+        tree_config.model.struct_encoder.edge_h_dim = ast.literal_eval(
+            tree_config.model.struct_encoder.edge_h_dim
+        )
 
     return tree_config
 
@@ -464,7 +547,7 @@ def prepare_saving_dir(configs, config_file_path):
         str: The path to the directory where the results will be saved.
     """
     # Create a unique identifier for the run based on the current time.
-    run_id = datetime.datetime.now().strftime('%Y-%m-%d__%H-%M-%S')
+    run_id = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
 
     # Add '_evaluation' to the run_id if the 'evaluate' flag is True.
     # if configs.evaluate:
@@ -472,9 +555,9 @@ def prepare_saving_dir(configs, config_file_path):
 
     # Create the result directory and the checkpoint subdirectory.
     result_path = os.path.abspath(os.path.join(configs.result_path, run_id))
-    checkpoint_path = os.path.join(result_path, 'checkpoints')
+    checkpoint_path = os.path.join(result_path, "checkpoints")
     Path(result_path).mkdir(parents=True, exist_ok=True)
-    Path(os.path.join(result_path, 'pdb_files')).mkdir(parents=True, exist_ok=True)
+    Path(os.path.join(result_path, "pdb_files")).mkdir(parents=True, exist_ok=True)
     Path(checkpoint_path).mkdir(parents=True, exist_ok=True)
 
     # Copy the config file to the result directory.
@@ -485,10 +568,10 @@ def prepare_saving_dir(configs, config_file_path):
 
 
 def load_encoder_decoder_configs(configs, result_path):
-    if configs.model.encoder.name == 'gcpnet':
-        encoder_config_file_path = os.path.join('configs', 'config_gcpnet_encoder.yaml')
+    if configs.model.encoder.name == "gcpnet":
+        encoder_config_file_path = os.path.join("configs", "config_gcpnet_encoder.yaml")
     else:
-        raise ValueError('Unknown encoder')
+        raise ValueError("Unknown encoder")
 
     with open(encoder_config_file_path) as file:
         encoder_config_file = yaml.full_load(file)
@@ -497,10 +580,12 @@ def load_encoder_decoder_configs(configs, result_path):
 
     shutil.copy(encoder_config_file_path, result_path)
 
-    if configs.model.vqvae.decoder.name == 'geometric_decoder':
-        decoder_config_file_path = os.path.join('configs', 'config_geometric_decoder.yaml')
+    if configs.model.vqvae.decoder.name == "geometric_decoder":
+        decoder_config_file_path = os.path.join(
+            "configs", "config_geometric_decoder.yaml"
+        )
     else:
-        raise ValueError('Unknown decoder')
+        raise ValueError("Unknown decoder")
 
     with open(decoder_config_file_path) as file:
         decoder_config_file = yaml.full_load(file)
@@ -513,20 +598,20 @@ def load_encoder_decoder_configs(configs, result_path):
 
 
 def load_h5_file(file_path):
-    with h5py.File(file_path, 'r') as f:
-        seq = f['seq'][()]
-        n_ca_c_o_coord = f['N_CA_C_O_coord'][:]
-        plddt_scores = f['plddt_scores'][:]
+    with h5py.File(file_path, "r") as f:
+        seq = f["seq"][()]
+        n_ca_c_o_coord = f["N_CA_C_O_coord"][:]
+        plddt_scores = f["plddt_scores"][:]
     return seq, n_ca_c_o_coord, plddt_scores
 
 
 def save_backbone_pdb(
-        coords,
-        masks,
-        protein_name,
-        save_path_prefix,
-        atom_names=("N", "CA", "C"),
-        chain_id="A",
+    coords,
+    masks,
+    protein_name,
+    save_path_prefix,
+    atom_names=("N", "CA", "C"),
+    chain_id="A",
 ):
     """
     Write backbone (N, CA, C) atom coordinates to PDB files—one file per item in the batch—
@@ -624,11 +709,11 @@ def save_backbone_pdb(
 
 
 def save_backbone_pdb_inference(
-        coords,
-        masks,
-        save_path_prefix,
-        atom_names=("N", "CA", "C"),
-        chain_id="A",
+    coords,
+    masks,
+    save_path_prefix,
+    atom_names=("N", "CA", "C"),
+    chain_id="A",
 ):
     """
     Save a single backbone PDB file without sample suffix.
@@ -646,7 +731,7 @@ def save_backbone_pdb_inference(
 
     for b in range(B):
         # determine output path
-        if save_path_prefix.lower().endswith('.pdb'):
+        if save_path_prefix.lower().endswith(".pdb"):
             out_path = save_path_prefix
         else:
             out_path = f"{save_path_prefix}.pdb"
@@ -690,16 +775,31 @@ def save_backbone_pdb_inference(
             fh.write("TER\nEND\n")
 
 
-def write_chain_to_pdb(structure, chain_id, output_path, model_id=0, include_hetero=False, output_chain_id="A"):
+def write_chain_to_pdb(
+    structure,
+    chain_id,
+    output_path,
+    model_id=0,
+    include_hetero=False,
+    output_chain_id="A",
+):
     """Write a single chain from a structure object to a PDB file with a fixed chain identifier."""
 
     try:
-        target_model = structure[model_id] if model_id is not None else next(structure.get_models())
+        target_model = (
+            structure[model_id]
+            if model_id is not None
+            else next(structure.get_models())
+        )
     except Exception as exc:
-        raise ValueError(f"Model id '{model_id}' not found in structure '{structure.id}'.") from exc
+        raise ValueError(
+            f"Model id '{model_id}' not found in structure '{structure.id}'."
+        ) from exc
 
     if chain_id not in target_model.child_dict:
-        raise ValueError(f"Chain id '{chain_id}' not found in structure '{structure.id}'.")
+        raise ValueError(
+            f"Chain id '{chain_id}' not found in structure '{structure.id}'."
+        )
 
     chain = target_model[chain_id]
     chain_copy = chain.copy()
@@ -707,7 +807,7 @@ def write_chain_to_pdb(structure, chain_id, output_path, model_id=0, include_het
 
     if not include_hetero:
         for residue in list(chain_copy.get_residues()):
-            if residue.id[0] != ' ':
+            if residue.id[0] != " ":
                 chain_copy.detach_child(residue.id)
 
     directory = os.path.dirname(output_path)
@@ -720,7 +820,6 @@ def write_chain_to_pdb(structure, chain_id, output_path, model_id=0, include_het
 
 
 if __name__ == "__main__":
-
     bsz = 1
     num_res = 5
     pdb_path = "test.pdb"
@@ -735,7 +834,7 @@ if __name__ == "__main__":
 
     # Test ca_coords_to_pdb with h5 structures
     n_samps = 1
-    h5_samples = glob.glob(os.path.join(h5_path, '*.h5'))[:n_samps]
+    h5_samples = glob.glob(os.path.join(h5_path, "*.h5"))[:n_samps]
     batch_coords = []
     for i in range(n_samps):
         sample_path = h5_samples[i]
