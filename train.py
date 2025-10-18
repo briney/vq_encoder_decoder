@@ -165,10 +165,11 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
 
             accelerator.backward(loss_dict["step_loss"])
             if accelerator.sync_gradients:
-                if (
+                should_log_grad_norm = (
                     global_step % configs.train_settings.gradient_norm_logging_freq == 0
                     and global_step > 0
-                ):
+                )
+                if should_log_grad_norm:
                     # Calculate the gradient norm every configs.train_settings.gradient_norm_logging_freq steps
                     grad_norm = torch.norm(
                         torch.stack(
@@ -180,19 +181,19 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                         ),
                         2,
                     )
-                if accelerator.is_main_process and configs.tensorboard_log:
-                    writer.add_scalar(
-                        "gradient norm/total_amp_scaled",
-                        grad_norm.item(),
-                        global_step,
-                    )
+                    if accelerator.is_main_process and configs.tensorboard_log:
+                        writer.add_scalar(
+                            "gradient norm/total_amp_scaled",
+                            grad_norm.item(),
+                            global_step,
+                        )
 
-                # Log gradient norm to wandb
-                if configs.wandb.enabled:
-                    accelerator.log(
-                        {"train/gradient_norm/total_amp_scaled": grad_norm.item()},
-                        step=global_step,
-                    )
+                    # Log gradient norm to wandb
+                    if configs.wandb.enabled:
+                        accelerator.log(
+                            {"train/gradient_norm/total_amp_scaled": grad_norm.item()},
+                            step=global_step,
+                        )
 
                 # Accelerate Gradient clipping: unscale the gradients (only when using FP16 AMP) and then apply clipping
                 accelerator.clip_grad_norm_(
