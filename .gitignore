@@ -163,7 +163,7 @@ cython_debug/
 .vscode/
 data/validation/
 log/
-models/checkpoints/
+# models/checkpoints/
 results/
 inference_decode_results
 inference_encode_results
