@@ -43,6 +43,7 @@ RUN pip3 install --no-cache-dir 'git+https://github.com/katsura-jp/pytorch-cosin
 # Visualization and logging
 # -----------------------------
 RUN pip3 install --no-cache-dir tensorboard
+RUN pip3 install --no-cache-dir wandb
 
 # -----------------------------
 # Data handling & utilities

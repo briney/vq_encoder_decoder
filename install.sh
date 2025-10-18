@@ -21,6 +21,7 @@ pip install 'git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-war
 
 # Visualization and logging
 pip install tensorboard
+pip install wandb
 
 # Data handling & utilities
 pip install python-box

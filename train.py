@@ -524,46 +524,54 @@ def main(dict_config, config_file_path):
 
     # Initialize wandb tracker if enabled
     if configs.wandb.enabled:
-        # Ensure wandb is logged in (will prompt for API key if needed)
+        # Try to login non-interactively if API key is provided; otherwise allow prompt.
+        # On failure (e.g., non-interactive fresh VM), fall back to offline mode.
         if accelerator.is_main_process:
             try:
-                wandb.login()
-                logging.info("Successfully logged in to wandb")
+                api_key = os.getenv("WANDB_API_KEY", None)
+                if api_key:
+                    wandb.login(key=api_key)
+                    logging.info("Successfully logged in to wandb via WANDB_API_KEY")
+                else:
+                    wandb.login()
+                    logging.info("Successfully logged in to wandb")
             except Exception as e:
-                logging.warning(f"Failed to login to wandb: {e}")
-                logging.warning("Continuing without wandb logging")
-                configs.wandb.enabled = False
+                logging.warning(f"wandb login failed; switching to offline mode: {e}")
+                os.environ["WANDB_MODE"] = "offline"
 
-        # Wait for login to complete on main process
+        # Wait for login/offline decision
         accelerator.wait_for_everyone()
 
-        if configs.wandb.enabled:
-            # Build wandb init kwargs
-            wandb_init_kwargs = {
-                "wandb": {
-                    "name": configs.wandb.name,
-                    "tags": configs.wandb.tags if configs.wandb.tags else None,
-                    "notes": configs.wandb.notes if configs.wandb.notes else None,
-                    "group": configs.wandb.group,
-                }
+        # Build wandb init kwargs and ensure local files go under result_path
+        wandb_init_kwargs = {
+            "wandb": {
+                "name": configs.wandb.name,
+                "tags": configs.wandb.tags if configs.wandb.tags else None,
+                "notes": configs.wandb.notes if configs.wandb.notes else None,
+                "group": configs.wandb.group,
+                "dir": result_path,
             }
-            # Add entity if specified
-            if configs.wandb.entity:
-                wandb_init_kwargs["wandb"]["entity"] = configs.wandb.entity
+        }
+        # Add entity if specified
+        if configs.wandb.entity:
+            wandb_init_kwargs["wandb"]["entity"] = configs.wandb.entity
+        # Respect offline mode if set by login fallback or pre-set env
+        if os.getenv("WANDB_MODE"):
+            wandb_init_kwargs["wandb"]["mode"] = os.environ["WANDB_MODE"]
 
-            # Remove None values to use wandb defaults
-            wandb_init_kwargs["wandb"] = {
-                k: v for k, v in wandb_init_kwargs["wandb"].items() if v is not None
-            }
+        # Remove None values to use wandb defaults
+        wandb_init_kwargs["wandb"] = {
+            k: v for k, v in wandb_init_kwargs["wandb"].items() if v is not None
+        }
 
-            accelerator.init_trackers(
-                project_name=configs.wandb.project,
-                config=dict_config,
-                init_kwargs=wandb_init_kwargs if wandb_init_kwargs["wandb"] else None,
-            )
-            logging.info(
-                f"Initialized wandb tracker for project: {configs.wandb.project}"
-            )
+        accelerator.init_trackers(
+            project_name=configs.wandb.project,
+            config=dict_config,
+            init_kwargs=wandb_init_kwargs if wandb_init_kwargs["wandb"] else None,
+        )
+        logging.info(
+            f"Initialized wandb tracker for project: {configs.wandb.project} (dir={result_path})"
+        )
 
     train_dataloader, valid_dataloader = prepare_gcpnet_vqvae_dataloaders(
         logging,
