@@ -215,35 +215,39 @@ def log_per_loss_components(
     writer, loss_dict, global_step, accelerator=None, wandb_enabled=False
 ):
     """
-    Log individual loss components to TensorBoard and wandb with hierarchical naming.
+    Log individual loss components at step cadence with unified names.
 
-    Args:
-        writer (SummaryWriter): TensorBoard writer.
-        loss_dict (dict): Dictionary containing individual loss components.
-        global_step (int): Current global training step.
-        accelerator: HuggingFace Accelerator instance (optional, for wandb logging).
-        wandb_enabled (bool): Whether wandb logging is enabled.
+    - TensorBoard keys: 'train/loss/{name}' and 'train/unscaled_loss/{name}'
+    - W&B keys: 'train/loss/{name}' and 'train/unscaled_loss/{name}'
+    - Skips aggregate duplicates: rec_loss, vq_loss, ntp_loss, step_loss (and unscaled counterparts)
     """
     wandb_metrics = {}
 
-    # Log each loss component with hierarchical naming
+    # Names to skip (aggregates are logged elsewhere)
+    skip_scaled = {"rec_loss", "vq_loss", "ntp_loss", "step_loss"}
+
     for loss_name, loss_value in loss_dict.items():
-        if torch.is_tensor(loss_value) and loss_value.numel() == 1:
-            if loss_name.startswith("unscaled_"):
-                base_name = loss_name[len("unscaled_") :]
-                writer.add_scalar(
-                    f"unscaled_step_loss/{base_name}", loss_value.item(), global_step
-                )
-                if wandb_enabled and accelerator is not None:
-                    wandb_metrics[f"train/unscaled_step_loss/{base_name}"] = (
-                        loss_value.item()
-                    )
-            else:
-                writer.add_scalar(
-                    f"step_loss/{loss_name}", loss_value.item(), global_step
-                )
-                if wandb_enabled and accelerator is not None:
-                    wandb_metrics[f"train/step_loss/{loss_name}"] = loss_value.item()
+        if not (torch.is_tensor(loss_value) and loss_value.numel() == 1):
+            continue
+
+        # Unscaled variants: map to 'train/unscaled_loss/{base_name}'
+        if loss_name.startswith("unscaled_"):
+            base_name = loss_name[len("unscaled_") :]
+            if base_name in skip_scaled:
+                continue
+            writer.add_scalar(
+                f"train/unscaled_loss/{base_name}", loss_value.item(), global_step
+            )
+            if wandb_enabled and accelerator is not None:
+                wandb_metrics[f"train/unscaled_loss/{base_name}"] = loss_value.item()
+            continue
+
+        # Scaled variants: map to 'train/loss/{loss_name}'
+        if loss_name in skip_scaled:
+            continue
+        writer.add_scalar(f"train/loss/{loss_name}", loss_value.item(), global_step)
+        if wandb_enabled and accelerator is not None:
+            wandb_metrics[f"train/loss/{loss_name}"] = loss_value.item()
 
     # Log to wandb
     if wandb_enabled and accelerator is not None and wandb_metrics:
@@ -292,138 +296,139 @@ def log_per_loss_grad_norms(
     loss_dict, net, configs, writer, accelerator, global_step, adaptive_loss_coeffs
 ):
     """
-    Log per-loss gradient norms, individual loss components, and adjust adaptive coefficients based on global gradient norms.
-    Only activates when adaptive mode is enabled and warmup period is complete.
-    Logs gradient norms, adaptive coefficients, and individual loss components to TensorBoard with hierarchical naming.
+    Decouple per-loss scalar logging from gradient-norm logging:
 
-    Args:
-        loss_dict (dict): Loss components from calculate_decoder_loss
-        net (torch.nn.Module): The model
-        configs: Configuration object
-        writer (SummaryWriter): TensorBoard writer
-        accelerator: HuggingFace Accelerator
-        global_step (int): Current global training step
-        adaptive_loss_coeffs (dict): Current adaptive coefficients
-
-    Returns:
-        dict: Updated adaptive coefficients
+    - Per-loss scalars log every `log_every_n_steps` (falls back to gradient_norm_logging_freq if unset).
+    - Gradient norms + adaptive coeff updates/logs follow `gradient_norm_logging_freq` and require
+      `configs.train_settings.log_separate_grad_norms`.
     """
-    # Early return if not logging step or not sync gradients
-    if not (
+    # Determine logging cadence
+    step_freq = getattr(configs.train_settings, "log_every_n_steps", None)
+    if not step_freq or step_freq <= 0:
+        step_freq = configs.train_settings.gradient_norm_logging_freq
+
+    # Gates
+    should_log_step_scalars = (
         accelerator.sync_gradients
-        and global_step % configs.train_settings.gradient_norm_logging_freq == 0
         and global_step > 0
+        and (global_step % step_freq == 0)
+    )
+    should_log_grad_norms = (
+        accelerator.sync_gradients
+        and global_step > 0
+        and (global_step % configs.train_settings.gradient_norm_logging_freq == 0)
         and configs.train_settings.log_separate_grad_norms
-    ):
+    )
+
+    if not should_log_step_scalars and not should_log_grad_norms:
         return adaptive_loss_coeffs
 
-    # Compute local gradient norms for each enabled loss with adaptive coefficients
-    local_grad_norms = {}
+    # Compute/log gradient norms and adjust coefficients
+    if should_log_grad_norms:
+        local_grad_norms = {}
 
-    # Get individual adaptive coefficient settings for each loss
-    mse_adaptive = configs.train_settings.losses.mse.adaptive_coefficient
-    backbone_distance_adaptive = (
-        configs.train_settings.losses.backbone_distance.adaptive_coefficient
-    )
-    backbone_direction_adaptive = (
-        configs.train_settings.losses.backbone_direction.adaptive_coefficient
-    )
-    binned_direction_adaptive = configs.train_settings.losses.binned_direction_classification.adaptive_coefficient
-    binned_distance_adaptive = configs.train_settings.losses.binned_distance_classification.adaptive_coefficient
-    ntp_adaptive = (
-        configs.train_settings.losses.next_token_prediction.adaptive_coefficient
-    )
-    tik_tok_adaptive = (
-        configs.model.vqvae.vector_quantization.tik_tok.adaptive_coefficient
-    )
-
-    if configs.train_settings.losses.mse.enabled and mse_adaptive:
-        local_grad_norms["mse"] = compute_grad_norm(
-            loss_dict["mse_loss"], net.parameters()
+        # Adaptive toggles
+        mse_adaptive = configs.train_settings.losses.mse.adaptive_coefficient
+        backbone_distance_adaptive = (
+            configs.train_settings.losses.backbone_distance.adaptive_coefficient
+        )
+        backbone_direction_adaptive = (
+            configs.train_settings.losses.backbone_direction.adaptive_coefficient
+        )
+        binned_direction_adaptive = configs.train_settings.losses.binned_direction_classification.adaptive_coefficient
+        binned_distance_adaptive = configs.train_settings.losses.binned_distance_classification.adaptive_coefficient
+        ntp_adaptive = (
+            configs.train_settings.losses.next_token_prediction.adaptive_coefficient
+        )
+        tik_tok_adaptive = (
+            configs.model.vqvae.vector_quantization.tik_tok.adaptive_coefficient
         )
 
-    if (
-        configs.train_settings.losses.backbone_distance.enabled
-        and backbone_distance_adaptive
-    ):
-        local_grad_norms["backbone_distance"] = compute_grad_norm(
-            loss_dict["backbone_distance_loss"], net.parameters()
-        )
-
-    if (
-        configs.train_settings.losses.backbone_direction.enabled
-        and backbone_direction_adaptive
-    ):
-        local_grad_norms["backbone_direction"] = compute_grad_norm(
-            loss_dict["backbone_direction_loss"], net.parameters()
-        )
-
-    if (
-        configs.train_settings.losses.binned_direction_classification.enabled
-        and binned_direction_adaptive
-    ):
-        local_grad_norms["binned_direction_classification"] = compute_grad_norm(
-            loss_dict["binned_direction_classification_loss"], net.parameters()
-        )
-
-    if (
-        configs.train_settings.losses.binned_distance_classification.enabled
-        and binned_distance_adaptive
-    ):
-        local_grad_norms["binned_distance_classification"] = compute_grad_norm(
-            loss_dict["binned_distance_classification_loss"], net.parameters()
-        )
-
-    if (
-        getattr(configs.train_settings.losses, "next_token_prediction", None)
-        and configs.train_settings.losses.next_token_prediction.enabled
-        and ntp_adaptive
-        and ("ntp_loss" in loss_dict)
-    ):
-        local_grad_norms["ntp"] = compute_grad_norm(
-            loss_dict["ntp_loss"], net.parameters()
-        )
-
-    if configs.model.vqvae.vector_quantization.enabled:
-        local_grad_norms["vq"] = compute_grad_norm(
-            loss_dict.get("vq_loss", torch.tensor(0.0)), net.parameters()
-        )
-
-    if configs.model.vqvae.vector_quantization.tik_tok.enabled and tik_tok_adaptive:
-        tik_tok_loss = loss_dict.get("tik_tok_padding_loss", None)
-        if isinstance(tik_tok_loss, torch.Tensor) and tik_tok_loss.requires_grad:
-            local_grad_norms["tik_tok_padding"] = compute_grad_norm(
-                tik_tok_loss, net.parameters()
+        if configs.train_settings.losses.mse.enabled and mse_adaptive:
+            local_grad_norms["mse"] = compute_grad_norm(
+                loss_dict["mse_loss"], net.parameters()
             )
 
-    zero = torch.tensor(0.0, device=loss_dict["rec_loss"].device)
-    total_loss_unscaled = (
-        loss_dict["rec_loss"]
-        + loss_dict.get("vq_loss", zero)
-        + loss_dict.get("ntp_loss", zero)
-        + loss_dict.get("tik_tok_padding_loss", zero)
-    )
-    local_grad_norms["total_unscaled"] = compute_grad_norm(
-        total_loss_unscaled, net.parameters()
-    )
+        if (
+            configs.train_settings.losses.backbone_distance.enabled
+            and backbone_distance_adaptive
+        ):
+            local_grad_norms["backbone_distance"] = compute_grad_norm(
+                loss_dict["backbone_distance_loss"], net.parameters()
+            )
 
-    # Aggregate across ranks for global signal
-    global_grad_norms = aggregate_grad_norms(local_grad_norms, accelerator)
+        if (
+            configs.train_settings.losses.backbone_direction.enabled
+            and backbone_direction_adaptive
+        ):
+            local_grad_norms["backbone_direction"] = compute_grad_norm(
+                loss_dict["backbone_direction_loss"], net.parameters()
+            )
 
-    # Adjust coefficients and broadcast (only after warmup and if any adaptive coefficients are enabled)
-    if (
-        accelerator.is_main_process
-        and global_step > configs.optimizer.decay.warmup
-        and configs.train_settings.adaptive_loss_coefficient
-        and len(local_grad_norms) > 0
-    ):  # Only proceed if we have any losses with adaptive coefficients
-        adaptive_loss_coeffs = adjust_adaptive_coefficients(
-            adaptive_loss_coeffs, global_grad_norms, configs
+        if (
+            configs.train_settings.losses.binned_direction_classification.enabled
+            and binned_direction_adaptive
+        ):
+            local_grad_norms["binned_direction_classification"] = compute_grad_norm(
+                loss_dict["binned_direction_classification_loss"], net.parameters()
+            )
+
+        if (
+            configs.train_settings.losses.binned_distance_classification.enabled
+            and binned_distance_adaptive
+        ):
+            local_grad_norms["binned_distance_classification"] = compute_grad_norm(
+                loss_dict["binned_distance_classification_loss"], net.parameters()
+            )
+
+        if (
+            getattr(configs.train_settings.losses, "next_token_prediction", None)
+            and configs.train_settings.losses.next_token_prediction.enabled
+            and ntp_adaptive
+            and ("ntp_loss" in loss_dict)
+        ):
+            local_grad_norms["ntp"] = compute_grad_norm(
+                loss_dict["ntp_loss"], net.parameters()
+            )
+
+        if configs.model.vqvae.vector_quantization.enabled:
+            local_grad_norms["vq"] = compute_grad_norm(
+                loss_dict.get("vq_loss", torch.tensor(0.0)), net.parameters()
+            )
+
+        if configs.model.vqvae.vector_quantization.tik_tok.enabled and tik_tok_adaptive:
+            tik_tok_loss = loss_dict.get("tik_tok_padding_loss", None)
+            if isinstance(tik_tok_loss, torch.Tensor) and tik_tok_loss.requires_grad:
+                local_grad_norms["tik_tok_padding"] = compute_grad_norm(
+                    tik_tok_loss, net.parameters()
+                )
+
+        zero = torch.tensor(0.0, device=loss_dict["rec_loss"].device)
+        total_loss_unscaled = (
+            loss_dict["rec_loss"]
+            + loss_dict.get("vq_loss", zero)
+            + loss_dict.get("ntp_loss", zero)
+            + loss_dict.get("tik_tok_padding_loss", zero)
+        )
+        local_grad_norms["total_unscaled"] = compute_grad_norm(
+            total_loss_unscaled, net.parameters()
         )
 
-    if accelerator.is_main_process:
-        # Log gradient norms, coefficients, and individual loss components
-        if configs.tensorboard_log:
+        # Aggregate across ranks for global signal
+        global_grad_norms = aggregate_grad_norms(local_grad_norms, accelerator)
+
+        # Adjust coefficients and broadcast
+        if (
+            accelerator.is_main_process
+            and global_step > configs.optimizer.decay.warmup
+            and configs.train_settings.adaptive_loss_coefficient
+            and len(local_grad_norms) > 0
+        ):
+            adaptive_loss_coeffs = adjust_adaptive_coefficients(
+                adaptive_loss_coeffs, global_grad_norms, configs
+            )
+
+        if accelerator.is_main_process and configs.tensorboard_log:
             log_gradient_norms_and_coeffs(
                 writer,
                 global_grad_norms,
@@ -432,18 +437,25 @@ def log_per_loss_grad_norms(
                 accelerator=accelerator,
                 wandb_enabled=configs.wandb.enabled,
             )
-            log_per_loss_components(
-                writer,
-                loss_dict,
-                global_step,
-                accelerator=accelerator,
-                wandb_enabled=configs.wandb.enabled,
+
+        if global_step > configs.optimizer.decay.warmup and len(local_grad_norms) > 0:
+            adaptive_loss_coeffs = broadcast_coefficients(
+                adaptive_loss_coeffs, accelerator
             )
 
+    # Log per-loss scalars at their own cadence
     if (
-        global_step > configs.optimizer.decay.warmup and len(local_grad_norms) > 0
-    ):  # Only broadcast if we have any losses with adaptive coefficients
-        adaptive_loss_coeffs = broadcast_coefficients(adaptive_loss_coeffs, accelerator)
+        should_log_step_scalars
+        and accelerator.is_main_process
+        and configs.tensorboard_log
+    ):
+        log_per_loss_components(
+            writer,
+            loss_dict,
+            global_step,
+            accelerator=accelerator,
+            wandb_enabled=configs.wandb.enabled,
+        )
 
     return adaptive_loss_coeffs
 

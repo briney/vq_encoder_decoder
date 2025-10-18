@@ -231,6 +231,47 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                     + f"vq loss: {avgs['avg_unscaled_vq_loss']:.3f}]"
                 )
 
+                # Step-based normal train logs when configured
+                step_log_freq = getattr(
+                    configs.train_settings, "log_every_n_steps", None
+                )
+                if (
+                    step_log_freq is not None
+                    and step_log_freq > 0
+                    and global_step % step_log_freq == 0
+                    and accelerator.is_main_process
+                ):
+                    include_ntp = (
+                        getattr(
+                            configs.train_settings.losses, "next_token_prediction", None
+                        )
+                        and configs.train_settings.losses.next_token_prediction.enabled
+                    )
+                    # Gather metrics and activation at current running state
+                    metrics_values = compute_metrics(metrics)
+                    avg_activation = compute_activation(acc, codebook_size)
+                    if configs.tensorboard_log:
+                        log_tensorboard_epoch(
+                            writer,
+                            avgs,
+                            metrics_values,
+                            epoch,
+                            activation_percent=np.round(avg_activation * 100, 1),
+                            include_ntp=include_ntp,
+                            global_step=global_step,
+                        )
+                    if configs.wandb.enabled:
+                        log_wandb_epoch(
+                            accelerator,
+                            "train",
+                            avgs,
+                            metrics_values,
+                            epoch,
+                            activation_percent=np.round(avg_activation * 100, 1),
+                            include_ntp=include_ntp,
+                            global_step=global_step,
+                        )
+
                 # Check if we've reached max_steps
                 if global_step >= max_steps:
                     logging.info(
@@ -247,8 +288,13 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     metrics_values = compute_metrics(metrics)
     avg_activation = compute_activation(acc, codebook_size)
 
-    # Log metrics to TensorBoard
-    if accelerator.is_main_process and configs.tensorboard_log:
+    # Log metrics to TensorBoard (epoch-based only when step-based logging is disabled)
+    step_log_freq = getattr(configs.train_settings, "log_every_n_steps", None)
+    if (
+        accelerator.is_main_process
+        and configs.tensorboard_log
+        and (step_log_freq is None or step_log_freq <= 0)
+    ):
         include_ntp = (
             getattr(configs.train_settings.losses, "next_token_prediction", None)
             and configs.train_settings.losses.next_token_prediction.enabled
@@ -263,8 +309,8 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
             global_step=global_step,
         )
 
-    # Log metrics to wandb
-    if configs.wandb.enabled:
+    # Log metrics to wandb (epoch-based only when step-based logging is disabled)
+    if configs.wandb.enabled and (step_log_freq is None or step_log_freq <= 0):
         include_ntp = (
             getattr(configs.train_settings.losses, "next_token_prediction", None)
             and configs.train_settings.losses.next_token_prediction.enabled
