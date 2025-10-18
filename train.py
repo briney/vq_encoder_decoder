@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import numpy as np
 import torch
+import wandb
 import yaml
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
@@ -523,30 +524,46 @@ def main(dict_config, config_file_path):
 
     # Initialize wandb tracker if enabled
     if configs.wandb.enabled:
-        # Build wandb init kwargs
-        wandb_init_kwargs = {
-            "wandb": {
-                "name": configs.wandb.name,
-                "tags": configs.wandb.tags if configs.wandb.tags else None,
-                "notes": configs.wandb.notes if configs.wandb.notes else None,
-                "group": configs.wandb.group,
+        # Ensure wandb is logged in (will prompt for API key if needed)
+        if accelerator.is_main_process:
+            try:
+                wandb.login()
+                logging.info("Successfully logged in to wandb")
+            except Exception as e:
+                logging.warning(f"Failed to login to wandb: {e}")
+                logging.warning("Continuing without wandb logging")
+                configs.wandb.enabled = False
+
+        # Wait for login to complete on main process
+        accelerator.wait_for_everyone()
+
+        if configs.wandb.enabled:
+            # Build wandb init kwargs
+            wandb_init_kwargs = {
+                "wandb": {
+                    "name": configs.wandb.name,
+                    "tags": configs.wandb.tags if configs.wandb.tags else None,
+                    "notes": configs.wandb.notes if configs.wandb.notes else None,
+                    "group": configs.wandb.group,
+                }
             }
-        }
-        # Add entity if specified
-        if configs.wandb.entity:
-            wandb_init_kwargs["wandb"]["entity"] = configs.wandb.entity
+            # Add entity if specified
+            if configs.wandb.entity:
+                wandb_init_kwargs["wandb"]["entity"] = configs.wandb.entity
 
-        # Remove None values to use wandb defaults
-        wandb_init_kwargs["wandb"] = {
-            k: v for k, v in wandb_init_kwargs["wandb"].items() if v is not None
-        }
+            # Remove None values to use wandb defaults
+            wandb_init_kwargs["wandb"] = {
+                k: v for k, v in wandb_init_kwargs["wandb"].items() if v is not None
+            }
 
-        accelerator.init_trackers(
-            project_name=configs.wandb.project,
-            config=dict_config,
-            init_kwargs=wandb_init_kwargs if wandb_init_kwargs["wandb"] else None,
-        )
-        logging.info(f"Initialized wandb tracker for project: {configs.wandb.project}")
+            accelerator.init_trackers(
+                project_name=configs.wandb.project,
+                config=dict_config,
+                init_kwargs=wandb_init_kwargs if wandb_init_kwargs["wandb"] else None,
+            )
+            logging.info(
+                f"Initialized wandb tracker for project: {configs.wandb.project}"
+            )
 
     train_dataloader, valid_dataloader = prepare_gcpnet_vqvae_dataloaders(
         logging,
