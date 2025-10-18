@@ -239,7 +239,6 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                     step_log_freq is not None
                     and step_log_freq > 0
                     and global_step % step_log_freq == 0
-                    and accelerator.is_main_process
                 ):
                     include_ntp = (
                         getattr(
