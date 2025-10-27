@@ -190,3 +190,6 @@ evaluation_results
 # all txts in root and subdirectories
 **/*.txt
 utils/source
+
+# macOS 
+.DS_Store
