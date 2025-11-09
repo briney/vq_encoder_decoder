@@ -266,18 +266,25 @@ python inference_encode.py
 Edit `configs/inference_encode_config.yaml` to change dataset paths, model, and output. Input datasets should be `.h5` as in [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
 
 #### Streaming results (Parquet shards)
-For very large inference runs, `inference_encode_bb.py` streams results per rank to a Parquet dataset directory (many small shard files) to avoid out‑of‑memory issues. Enable and tune with:
+For very large inference runs, `inference_encode_bb.py` streams results per rank to a Parquet dataset directory (many small shard files) to avoid out‑of‑memory issues. Control via CLI flags:
 
 ```yaml
-# configs/inference_encode_config.yaml
-streaming_chunk_size: 10000           # rows per shard file
-parquet_compression: "zstd"           # or "snappy"
-dataset_subdir: "parquet_dataset"     # written inside the timestamped result_dir
+# Example with Accelerate
+accelerate launch inference_encode_bb.py \
+  --config configs/inference_encode_config.yaml \
+  --streaming-chunk-size 10000 \
+  --parquet-compression zstd \
+  --dataset-subdir parquet_dataset
 
-# Optional: merge all shards to a single Parquet file on main process (out-of-core)
-merge_to_single_parquet: false
-final_parquet_filename: "vq_indices.parquet"
-delete_shards_after_merge: false
+# Optional: merge shards to single Parquet (out-of-core) on main process
+accelerate launch inference_encode_bb.py \
+  --config configs/inference_encode_config.yaml \
+  --streaming-chunk-size 10000 \
+  --parquet-compression zstd \
+  --dataset-subdir parquet_dataset \
+  --merge-to-single-parquet \
+  --final-parquet-filename vq_indices.parquet \
+  --delete-shards-after-merge
 ```
 
 Reading the dataset without merging:

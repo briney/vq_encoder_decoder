@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import functools
 import os
@@ -20,6 +21,49 @@ from models.super_model import (
     prepare_model,
 )
 from utils.utils import get_logging, load_checkpoints_simple, load_configs
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default="configs/inference_encode_config.yaml",
+        help="Path to inference YAML config.",
+    )
+    # Parquet streaming/merge flags (moved from YAML)
+    parser.add_argument(
+        "--streaming-chunk-size",
+        type=int,
+        default=10000,
+        help="Rows per shard file before flushing to disk.",
+    )
+    parser.add_argument(
+        "--parquet-compression",
+        choices=["zstd", "snappy"],
+        default="zstd",
+        help="Compression codec for Parquet shards.",
+    )
+    parser.add_argument(
+        "--dataset-subdir",
+        default="parquet_dataset",
+        help="Subdirectory inside the timestamped result_dir to write shards.",
+    )
+    parser.add_argument(
+        "--merge-to-single-parquet",
+        action="store_true",
+        help="If set, merge shards to a single Parquet file on main process (out-of-core).",
+    )
+    parser.add_argument(
+        "--final-parquet-filename",
+        default="vq_indices.parquet",
+        help="Filename for the merged Parquet if --merge-to-single-parquet is set.",
+    )
+    parser.add_argument(
+        "--delete-shards-after-merge",
+        action="store_true",
+        help="If set, delete shard files after successful single-file merge.",
+    )
+    return parser.parse_args()
 
 
 def load_saved_encoder_decoder_configs(encoder_cfg_path, decoder_cfg_path):
@@ -137,8 +181,9 @@ def flush_chunk(records_buf, out_dir, rank, chunk_idx, schema, compression="zstd
 
 
 def main():
+    args = parse_args()
     # Load inference configuration
-    with open("configs/inference_encode_config.yaml") as f:
+    with open(args.config) as f:
         infer_cfg = yaml.full_load(f)
     infer_cfg = Box(infer_cfg)
 
@@ -159,7 +204,10 @@ def main():
     if accelerator.is_main_process:
         result_dir = os.path.join(infer_cfg.output_base_dir, now)
         os.makedirs(result_dir, exist_ok=True)
-        shutil.copy("configs/inference_encode_config.yaml", result_dir)
+        try:
+            shutil.copy(args.config, result_dir)
+        except Exception:
+            pass
         paths = [result_dir]
     else:
         # Initialize with placeholders.
@@ -219,6 +267,27 @@ def main():
     # Setup file logger in result directory
     logger = get_logging(result_dir, configs)
 
+    # Optional: warn if deprecated Parquet keys are found in YAML (ignored in favor of CLI)
+    deprecated_parquet_keys = [
+        "streaming_chunk_size",
+        "parquet_compression",
+        "dataset_subdir",
+        "merge_to_single_parquet",
+        "final_parquet_filename",
+        "delete_shards_after_merge",
+    ]
+    try:
+        found_deprecated = [k for k in deprecated_parquet_keys if k in infer_cfg]
+        if found_deprecated:
+            logger.warning(
+                "Deprecated Parquet options in YAML are ignored: "
+                + ", ".join(found_deprecated)
+                + ". Use CLI flags instead."
+            )
+    except Exception:
+        # If Box membership check fails for any reason, ignore silently.
+        pass
+
     # Prepare model
     model = prepare_model(
         configs,
@@ -265,10 +334,10 @@ def main():
     # Initialize streaming Parquet dataset settings
     rank = accelerator.process_index
     dataset_dir = os.path.join(
-        result_dir, infer_cfg.get("dataset_subdir", "parquet_dataset")
+        result_dir, getattr(args, "dataset_subdir", "parquet_dataset")
     )
-    chunk_size = infer_cfg.get("streaming_chunk_size", 10_000)
-    parquet_compression = infer_cfg.get("parquet_compression", "zstd")
+    chunk_size = getattr(args, "streaming_chunk_size", 10_000)
+    parquet_compression = getattr(args, "parquet_compression", "zstd")
     schema = make_parquet_schema()
     records_buf = []
     chunk_idx = 0
@@ -332,9 +401,10 @@ def main():
     accelerator.wait_for_everyone()
 
     # Optional: out-of-core merge to a single Parquet on the main process only
-    if accelerator.is_main_process and infer_cfg.get("merge_to_single_parquet", False):
+    if accelerator.is_main_process and getattr(args, "merge_to_single_parquet", False):
         final_parquet = os.path.join(
-            result_dir, infer_cfg.get("final_parquet_filename", "vq_indices.parquet")
+            result_dir,
+            getattr(args, "final_parquet_filename", "vq_indices.parquet"),
         )
         # Gather all shard files
         try:
@@ -359,7 +429,7 @@ def main():
             logger.info(f"Single-file Parquet written to {final_parquet}")
 
             # Optionally delete shards after merge
-            if infer_cfg.get("delete_shards_after_merge", False):
+            if getattr(args, "delete_shards_after_merge", False):
                 removed = 0
                 for path in shard_paths:
                     try:

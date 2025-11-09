@@ -21,14 +21,3 @@ compile_model:
   mode: null
   backend: inductor
   compile_encoder: True
-
-# Streaming Parquet dataset (sharded) settings
-# Results are written in chunks per rank to a Parquet dataset directory.
-streaming_chunk_size: 10000           # rows per shard file before flushing to disk
-parquet_compression: "zstd"           # "zstd" (recommended) or "snappy"
-dataset_subdir: "parquet_dataset"     # subdirectory inside the timestamped result_dir
-
-# Optional: merge all shards to a single Parquet file on main process only (out-of-core)
-merge_to_single_parquet: false
-final_parquet_filename: "vq_indices.parquet"
-delete_shards_after_merge: false
