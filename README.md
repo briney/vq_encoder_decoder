@@ -265,6 +265,31 @@ python inference_encode.py
 ```
 Edit `configs/inference_encode_config.yaml` to change dataset paths, model, and output. Input datasets should be `.h5` as in [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
 
+#### Streaming results (Parquet shards)
+For very large inference runs, `inference_encode_bb.py` streams results per rank to a Parquet dataset directory (many small shard files) to avoid out‑of‑memory issues. Enable and tune with:
+
+```yaml
+# configs/inference_encode_config.yaml
+streaming_chunk_size: 10000           # rows per shard file
+parquet_compression: "zstd"           # or "snappy"
+dataset_subdir: "parquet_dataset"     # written inside the timestamped result_dir
+
+# Optional: merge all shards to a single Parquet file on main process (out-of-core)
+merge_to_single_parquet: false
+final_parquet_filename: "vq_indices.parquet"
+delete_shards_after_merge: false
+```
+
+Reading the dataset without merging:
+- DuckDB: `SELECT * FROM '<result_dir>/parquet_dataset/*.parquet'`
+- Polars: `pl.scan_parquet('<result_dir>/parquet_dataset/*.parquet')`
+- PyArrow Dataset:
+
+```python
+import pyarrow.dataset as ds
+dataset = ds.dataset("<result_dir>/parquet_dataset", format="parquet")
+```
+
 To extract per‑residue embeddings from the VQ layer:
 ```bash
 python inference_embed.py

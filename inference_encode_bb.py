@@ -1,10 +1,10 @@
-import csv
 import datetime
 import functools
 import os
 import shutil
 
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import yaml
 from accelerate import Accelerator, DataLoaderConfiguration
@@ -90,6 +90,50 @@ def extract_n_ca_c_coords(batch):
         tri = flat.reshape(L, 3, 3)  # (L, 3, 3) [N, CA, C]
         out.append(tri.detach().cpu().tolist())
     return out
+
+
+def record_indices_typed(pids, indices_tensor, sequences, records, coords_nested=None):
+    """
+    Append typed records without string-flattening:
+    - indices: List[int]
+    - coordinates: List[List[List[float]]] in [N, CA, C] order with shape [seq_len, 3, 3]
+    """
+    cpu_inds = indices_tensor.detach().cpu().tolist()
+    if not isinstance(cpu_inds, list):
+        cpu_inds = [cpu_inds]
+    for i, (pid, idx, seq) in enumerate(zip(pids, cpu_inds, sequences)):
+        if not isinstance(idx, list):
+            idx = [idx]
+        cleaned = [int(v) for v in idx if v != -1]
+        if cleaned:
+            rec = {"pid": pid, "indices": cleaned, "protein_sequence": seq}
+            if coords_nested is not None:
+                rec["coordinates"] = coords_nested[i]
+            records.append(rec)
+
+
+def make_parquet_schema():
+    return pa.schema(
+        [
+            ("pid", pa.string()),
+            ("indices", pa.list_(pa.int32())),
+            ("protein_sequence", pa.string()),
+            ("coordinates", pa.list_(pa.list_(pa.list_(pa.float32())))),
+        ]
+    )
+
+
+def flush_chunk(records_buf, out_dir, rank, chunk_idx, schema, compression="zstd"):
+    if not records_buf:
+        return chunk_idx
+    table = pa.Table.from_pylist(records_buf, schema=schema)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(
+        out_dir, f"part-rank{rank:02d}-chunk{chunk_idx:06d}.parquet"
+    )
+    pq.write_table(table, out_path, compression=compression)
+    records_buf.clear()
+    return chunk_idx + 1
 
 
 def main():
@@ -218,8 +262,16 @@ def main():
     # Prepare everything with accelerator (model and dataloader)
     model, loader = accelerator.prepare(model, loader)
 
-    # Prepare for optional VQ index recording
-    indices_records = []  # list of dicts {'pid': str, 'indices': list[int]}
+    # Initialize streaming Parquet dataset settings
+    rank = accelerator.process_index
+    dataset_dir = os.path.join(
+        result_dir, infer_cfg.get("dataset_subdir", "parquet_dataset")
+    )
+    chunk_size = infer_cfg.get("streaming_chunk_size", 10_000)
+    parquet_compression = infer_cfg.get("parquet_compression", "zstd")
+    schema = make_parquet_schema()
+    records_buf = []
+    chunk_idx = 0
 
     # Initialize the progress bar using tqdm (separate from iteration)
     progress_bar = tqdm(
@@ -245,9 +297,20 @@ def main():
 
             # record indices and ground-truth N/CA/C coords per sample
             coords_nested = extract_n_ca_c_coords(batch)
-            record_indices(
-                pids, indices, sequences, indices_records, coords_nested=coords_nested
+            record_indices_typed(
+                pids, indices, sequences, records_buf, coords_nested=coords_nested
             )
+
+            # Flush per-chunk to Parquet
+            if len(records_buf) >= chunk_size:
+                chunk_idx = flush_chunk(
+                    records_buf=records_buf,
+                    out_dir=dataset_dir,
+                    rank=rank,
+                    chunk_idx=chunk_idx,
+                    schema=schema,
+                    compression=parquet_compression,
+                )
 
             # Update progress bar manually
             progress_bar.update(1)
@@ -255,59 +318,65 @@ def main():
     # logger.info(f"Inference encoding completed. Results are saved in {result_dir}")
     logger.info("Inference encoding completed.")
 
-    # Ensure all processes have completed before saving results
+    # Flush any remaining buffered records on this rank
+    chunk_idx = flush_chunk(
+        records_buf=records_buf,
+        out_dir=dataset_dir,
+        rank=rank,
+        chunk_idx=chunk_idx,
+        schema=schema,
+        compression=parquet_compression,
+    )
+
+    # Ensure all processes have completed before any optional merge
     accelerator.wait_for_everyone()
 
-    # Each rank writes its own shard to disk using Parquet (fallback to CSV if needed)
-    rank = accelerator.process_index
-    tmp_parquet = os.path.join(result_dir, f"vq_indices_rank{rank}.parquet")
-    # tmp_csv_shard = os.path.join(result_dir, f"vq_indices_rank{rank}.csv")
-
-    local_df = pd.DataFrame(indices_records)
-    # local_df.to_csv(tmp_csv_shard, index=False)
-    local_df.to_parquet(tmp_parquet, index=False)
-
-    # Wait for all shards, then merge on the main process
-    accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        # csv_filename = infer_cfg.get("vq_indices_csv_filename", "vq_indices.csv")
-        # final_csv = os.path.join(result_dir, csv_filename)
-        parquet_filename = infer_cfg.get(
-            "vq_indices_csv_filename", "vq_indices.parquet"
-        ).replace(".csv", ".parquet")
-        final_parquet = os.path.join(result_dir, parquet_filename)
-
-        expected_parquet = [
-            os.path.join(result_dir, f"vq_indices_rank{r}.parquet")
-            for r in range(accelerator.num_processes)
-        ]
-
-        merged_parquet = pd.concat(
-            [pd.read_parquet(p) for p in expected_parquet], ignore_index=True
+    # Optional: out-of-core merge to a single Parquet on the main process only
+    if accelerator.is_main_process and infer_cfg.get("merge_to_single_parquet", False):
+        final_parquet = os.path.join(
+            result_dir, infer_cfg.get("final_parquet_filename", "vq_indices.parquet")
         )
-        merged_parquet.to_parquet(final_parquet, index=False)
+        # Gather all shard files
+        try:
+            shard_paths = sorted(
+                [
+                    os.path.join(dataset_dir, f)
+                    for f in os.listdir(dataset_dir)
+                    if f.endswith(".parquet")
+                ]
+            )
+        except FileNotFoundError:
+            shard_paths = []
 
-        # # Stream-append CSV shards to final CSV to minimize memory
-        # with open(final_csv, "w", newline="") as out_f:
-        #     writer = csv.writer(out_f)
-        #     writer.writerow(["pid", "indices", "protein_sequence"])
-        #     for shard in expected_csv:
-        #         if not os.path.exists(shard):
-        #             continue
-        #         with open(shard, "r") as in_f:
-        #             reader = csv.reader(in_f)
-        #             next(reader, None)  # skip header
-        #             writer.writerows(reader)
-        # logger.info(f"Saved indices CSV: {final_csv}")
+        if shard_paths:
+            with pq.ParquetWriter(
+                final_parquet, schema=schema, compression=parquet_compression
+            ) as writer:
+                for path in shard_paths:
+                    pf = pq.ParquetFile(path)
+                    for rg in range(pf.num_row_groups):
+                        writer.write_table(pf.read_row_group(rg))
+            logger.info(f"Single-file Parquet written to {final_parquet}")
 
-        # Cleanup shard files
-        for p in expected_parquet:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
+            # Optionally delete shards after merge
+            if infer_cfg.get("delete_shards_after_merge", False):
+                removed = 0
+                for path in shard_paths:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except OSError:
+                        pass
+                logger.info(
+                    f"Deleted {removed} shard files after merge from {dataset_dir}"
+                )
+        else:
+            logger.warning(
+                f"No shard files found in {dataset_dir}; skipping single-file merge."
+            )
+    else:
+        if accelerator.is_main_process:
+            logger.info(f"Parquet dataset written to {dataset_dir}")
 
     # Ensure all processes have completed before exiting
     accelerator.wait_for_everyone()
