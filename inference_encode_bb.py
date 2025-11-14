@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import yaml
-from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate import Accelerator, DataLoaderConfiguration, InitProcessGroupKwargs
 from accelerate.utils import broadcast_object_list
 from box import Box
 from torch.utils.data import DataLoader
@@ -192,10 +192,13 @@ def main():
         non_blocking=True,
         even_batches=False,
     )
+    init_pg = InitProcessGroupKwargs(timeout=datetime.timedelta(hours=12))
 
     # Initialize accelerator for mixed precision and multi-GPU
     accelerator = Accelerator(
-        mixed_precision=infer_cfg.mixed_precision, dataloader_config=dataloader_config
+        mixed_precision=infer_cfg.mixed_precision,
+        dataloader_config=dataloader_config,
+        kwargs_handlers=[init_pg],
     )
 
     # Setup output directory with timestamp
@@ -449,7 +452,6 @@ def main():
             logger.info(f"Parquet dataset written to {dataset_dir}")
 
     # Ensure all processes have completed before exiting
-    accelerator.wait_for_everyone()
     accelerator.free_memory()
     accelerator.end_training()
 
